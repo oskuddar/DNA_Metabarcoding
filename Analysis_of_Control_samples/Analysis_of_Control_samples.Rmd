@@ -1,0 +1,333 @@
+---
+title: "Analysis of Control Samples"
+output: html_document
+author: "Ozge Shera Kuddar"
+---
+
+# Control Sample Analysis
+# 
+# Venn Diagram, Upset Plot
+# Comparison of presence/absence for High and Low Control Samples
+
+```{R}
+
+
+library(arrow) 
+library(dplyr)
+library(Biostrings)
+library(ggplot2)
+library(tidyr)
+
+set.seed(1453) # Taxonomy assignment needs seed for reproducibility
+
+trnl_RA <- read_feather("/Users/PhD_Process/The_Last_Process/The_Last_Writing/GitHub/Process_Raw_Reads/Control_Sample_Reads/Control_Samples_trnl_family_4e-04.feather")
+its2_RA <- read_feather("/Users/PhD_Process/The_Last_Process/The_Last_Writing/GitHub/Process_Raw_Reads/Control_Sample_Reads/Control_Samples_its2_family_4e-04.feather")
+
+morph <- read.csv("/Users/PhD_Process/The_Last_Process/The_Last_Writing/GitHub/Control_Sample_Analysis/Chris_Control_Samples.csv")
+
+
+trnl_RA   <- trnl_RA[   trnl_RA$Sample   != "DNAPool1_Low_Pollen_Only_C", ]
+its2_RA   <- its2_RA[   its2_RA$Sample   != "DNAPool1_Low_Pollen_Only_C", ]
+
+trnl_RA_high <- trnl_RA[grepl("High_Pollen_Only", trnl_RA$Sample), ]
+trnl_RA_low  <- trnl_RA[grepl("Low_Pollen_Only",  trnl_RA$Sample), ]
+
+its2_RA_high <- its2_RA[grepl("High_Pollen_Only", its2_RA$Sample), ]
+its2_RA_low  <- its2_RA[grepl("Low_Pollen_Only",  its2_RA$Sample), ]
+
+remove_zero_rows_cols <- function(df) {
+  tax_cols <- setdiff(colnames(df), "Sample")
+  df <- df[rowSums(df[, tax_cols, drop = FALSE]) != 0, , drop = FALSE]
+  df <- df[, c("Sample", tax_cols[colSums(df[, tax_cols, drop = FALSE]) != 0]), drop = FALSE]
+  df
+}
+
+morph <- morph %>% select(c(Family, High_Pollen_Pool, Low_Pollen_Pool))
+morph[is.na(morph)] <- "Unclassified"
+morph_collapsed <- aggregate(. ~ Family, data = morph, FUN = sum)
+morph_high <- morph_collapsed %>% select(Family, High_Pollen_Pool)
+morph_low <- morph_collapsed %>% select(Family, Low_Pollen_Pool)
+
+morph_high_RA <- morph_collapsed %>%
+  select(Family, High_Pollen_Pool) %>%
+  filter(High_Pollen_Pool != 0) %>%
+  mutate(High_Pollen_Pool = High_Pollen_Pool / sum(High_Pollen_Pool))
+morph_high_RA <- as.data.frame(morph_high_RA)
+
+morph_low_RA <- morph_collapsed %>%
+  select(Family, Low_Pollen_Pool) %>%
+  filter(Low_Pollen_Pool != 0) %>%
+  mutate(Low_Pollen_Pool = Low_Pollen_Pool / sum(Low_Pollen_Pool))
+morph_low_RA <- as.data.frame(morph_low_RA)
+
+
+###############################################################
+# --- Load CSV ---
+control_counts_df <- read.csv(
+  "/Users/PhD_Process/The_Last_Process/The_Last_Writing/GitHub/Control_Sample_Analysis/Control_Samples_Taxa_pollen_count.csv",
+  stringsAsFactors = FALSE
+)
+# Capitalize first letter of the taxonomy columns
+colnames(control_counts_df)[colnames(control_counts_df) == "family"]  <- "Family"
+
+# --- Split into HE (high) and LV (low) ---
+he_df <- control_counts_df[control_counts_df$Control_sample == "HE", ]
+lv_df <- control_counts_df[control_counts_df$Control_sample == "LV", ]
+
+# --- Function: aggregate counts + compute RA ---
+make_actual_tables <- function(df_input, taxon_col) {
+  df_sum <- aggregate(
+    df_input$Pollen_Count,
+    by = list(df_input[[taxon_col]]),
+    FUN = sum,
+    na.rm = TRUE
+  )
+  colnames(df_sum) <- c(taxon_col, "Count")
+  
+  df_sum$RA <- df_sum$Count / sum(df_sum$Count)
+  
+  df_sum[c(taxon_col, "RA")]
+}
+
+# ------------------------------
+# HIGH (HE)
+# ------------------------------
+actual_high_RA_family  <- make_actual_tables(he_df, "Family")
+
+
+# ------------------------------
+# LOW (LV)
+# ------------------------------
+actual_low_RA_family  <- make_actual_tables(lv_df, "Family")
+
+
+###############################################################
+
+
+keep_cols <- function(df) {
+  tax_cols <- setdiff(colnames(df), "Sample")
+  keep     <- colSums(df[, tax_cols] > 0, na.rm = TRUE) >= 2
+  df[, c("Sample", tax_cols[keep]), drop = FALSE]
+}
+
+
+trnl_RA_high <- keep_cols(trnl_RA_high)
+trnl_RA_low  <- keep_cols(trnl_RA_low)
+its2_RA_high <- keep_cols(its2_RA_high)
+its2_RA_low  <- keep_cols(its2_RA_low)
+
+
+# Remove cols/rows if zero
+trnl_RA_high <- remove_zero_rows_cols(trnl_RA_high)
+trnl_RA_low <- remove_zero_rows_cols(trnl_RA_low)
+its2_RA_high <- remove_zero_rows_cols(its2_RA_high)
+its2_RA_low <- remove_zero_rows_cols(its2_RA_low)
+
+
+make_median_RA <- function(df_input) {
+  tax_cols <- setdiff(colnames(df_input), "Sample")
+  df_vals  <- df_input[, tax_cols, drop = FALSE]
+  df_vals[df_vals <= 1e-6] <- NA
+  
+  df_median_output <- data.frame(
+    Family = tax_cols,
+    RA     = apply(df_vals, 2, function(x) median(x, na.rm = TRUE)),
+    row.names = NULL,
+    stringsAsFactors = FALSE
+  )
+  
+  df_median_output$RA <- df_median_output$RA / sum(df_median_output$RA, na.rm = TRUE)
+  df_median_output
+}
+
+
+
+trnl_RA_high_median  <- make_median_RA(trnl_RA_high)
+its2_high_median  <- make_median_RA(its2_RA_high)
+trnl_RA_low_median  <- make_median_RA(trnl_RA_low)
+its2_RA_low_median  <- make_median_RA(its2_RA_low)
+
+colnames(morph_high_RA)[colnames(morph_high_RA) == "High_Pollen_Pool"] <- "RA"
+colnames(morph_low_RA)[colnames(morph_low_RA) == "Low_Pollen_Pool"] <- "RA"
+
+###############################################################
+
+make_venn_df <- function(actual_df, trnl_df, its2_df, morph_df) {
+  
+  all_families <- unique(c(
+    actual_df$Family,
+    trnl_df$Family,
+    its2_df$Family,
+    morph_df$Family
+  ))
+  
+  venn_df <- data.frame(
+    Family = all_families,
+    Actual = actual_df$RA[match(all_families, actual_df$Family)],
+    trnL   = trnl_df$RA[match(all_families, trnl_df$Family)],
+    ITS2   = its2_df$RA[match(all_families, its2_df$Family)],
+    Morph  = morph_df$RA[match(all_families, morph_df$Family)],
+    stringsAsFactors = FALSE
+  )
+  
+  venn_pa <- venn_df
+  venn_pa[, 2:5] <- ifelse(is.na(venn_pa[, 2:5]), 0, 1)
+  
+  list(RA = venn_df, PA = venn_pa)
+}
+venn_high <- make_venn_df(
+  actual_high_RA_family,
+  trnl_RA_high_median,
+  its2_high_median,
+  morph_high_RA
+)
+
+venn_high_RA <- venn_high$RA
+venn_high_PA <- venn_high$PA
+venn_low <- make_venn_df(
+  actual_low_RA_family,
+  trnl_RA_low_median,
+  its2_RA_low_median,
+  morph_low_RA
+)
+
+venn_low_RA <- venn_low$RA
+venn_low_PA <- venn_low$PA
+
+
+
+
+library(ggVennDiagram)
+library(patchwork)
+library(grid)
+
+### ----- HIGH -----
+venn_high <- venn_high_PA
+venn_high <- venn_high[venn_high$Family != "Unclassified", ]
+
+venn_high_list <- list(
+  Actual = venn_high$Family[venn_high$Actual == 1],
+  trnL   = venn_high$Family[venn_high$trnL   == 1],
+  ITS2   = venn_high$Family[venn_high$ITS2   == 1],
+  Morph  = venn_high$Family[venn_high$Morph  == 1]
+)
+
+p_high <- ggVennDiagram(venn_high_list, label_alpha = 0, label = "count") +
+  scale_fill_gradient(low = "#FFE5E5", high = "red") +
+  ggtitle("High & Equal") +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(size = 22, face = "bold", hjust = 0.5, vjust=5),
+    text = element_text(face = "bold"),
+    plot.margin = unit(c(10, 60, 10, 10), "pt")   # <<< adds spacing
+  )
+
+
+### ----- LOW -----
+venn_low <- venn_low_PA
+venn_low <- venn_low[venn_low$Family != "Unclassified", ]
+
+venn_low_list <- list(
+  Actual = venn_low$Family[venn_low$Actual == 1],
+  trnL   = venn_low$Family[venn_low$trnL   == 1],
+  ITS2   = venn_low$Family[venn_low$ITS2   == 1],
+  Morph  = venn_low$Family[venn_low$Morph  == 1]
+)
+
+p_low <- ggVennDiagram(venn_low_list, label_alpha = 0, label = "count") +
+  scale_fill_gradient(low = "#E5F3FF", high = "#2B7ECF") +
+  ggtitle("Low & Variable") +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(size = 22, face = "bold", hjust = 0.5, vjust=5),
+    text = element_text(face = "bold"),
+    plot.margin = unit(c(10, 10, 10, 60), "pt")   # <<< adds spacing
+  )
+
+
+### ----- COMBINE WITH REAL SPACING -----
+combined <- p_high + p_low + plot_layout(ncol = 2)
+combined
+### ----- SAVE PDF -----
+ggsave("/Users/PhD_Process/The_Last_Process/The_Last_Writing/GitHub/Control_Sample_Analysis/Control_Samples_VennDiagram.pdf", combined, width = 14, height = 6)
+
+
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(patchwork)
+library(cowplot)
+library(grid)
+
+make_panel <- function(df_input, title_text, bar_color) {
+  
+  df2 <- df_input %>% 
+    filter(!is.na(Actual) & Actual > 0) %>%
+    mutate(trnL  = trnL  > 0,
+           ITS2  = ITS2  > 0,
+           Morph = Morph > 0)
+  
+  df2$Family <- factor(df2$Family, levels = df2$Family)
+  
+  df_long <- df2 %>%
+    pivot_longer(cols = c(trnL, ITS2, Morph),
+                 names_to = "Method",
+                 values_to = "Present") %>%
+    mutate(Method = factor(Method, levels = c("trnL","ITS2","Morph")))
+  
+  df_true  <- df_long %>% filter(Present)
+  df_false <- df_long %>% filter(!Present)
+  
+  shared_x <- scale_x_discrete(limits = levels(df2$Family))
+  
+  p_top <- ggplot(df2, aes(x = Family, y = Actual)) +
+    geom_col(fill = bar_color) +
+    shared_x +
+    scale_y_continuous(limits = c(0, 0.20),
+                       breaks = seq(0, 0.20, 0.1),
+                       expand = c(0, 0)) +
+    ggtitle(title_text) +
+    xlab("Family") +
+    ylab(NULL) +
+    theme_minimal(base_size = 14) +
+    theme(plot.title = element_text(size = 20, face = "bold", hjust = 0.5),
+          axis.text.x  = element_text(angle = 45, hjust = 1, size = 16, face="bold"),
+          axis.text.y = element_text(size = 20),
+          axis.title.x = element_blank())
+  
+  p_bottom <- ggplot() +
+    geom_point(data = df_false,
+               aes(x = Family, y = Method),
+               color = "white", fill = "white",
+               shape = 21, stroke = 0.6, size = 3) +
+    geom_point(data = df_true,
+               aes(x = Family, y = Method),
+               color = "black", fill = "black",
+               shape = 21, size = 5) +
+    shared_x +
+    scale_y_discrete(labels = c(expression(italic("trnL")), "ITS2", "Morph")) +
+    theme_minimal(base_size = 14) +
+    theme(axis.text.x  = element_blank(),
+          axis.title.x = element_blank(),
+          axis.text.y = ggtext::element_markdown(size = 18, face="bold"),
+          legend.position = "none")
+  
+  p_top / p_bottom + plot_layout(heights = c(3,3))
+}
+
+p_high <- make_panel(venn_high_RA, "High & Equal", "#FFB3C6")
+p_low  <- make_panel(venn_low_RA,  "Low & Variable", "#A7C7E7")
+
+combined <- patchwork::wrap_plots(list(p_high, p_low), ncol = 1)
+
+final_plot <- cowplot::ggdraw() +
+  cowplot::draw_label("Actual Proportions", angle = 90, fontface = "bold", size = 20, x = 0.05, y = 0.5) +
+  cowplot::draw_plot(combined, x = 0.08, y = 0, width = 0.92, height = 1)
+
+final_plot
+
+ggsave("/Users/PhD_Process/The_Last_Process/The_Last_Writing/GitHub/Control_Sample_Analysis/Control_Samples_KindaUpsetPlot.pdf",
+       plot = final_plot,
+       width = 16, height = 10, units = "in")
+
+```
