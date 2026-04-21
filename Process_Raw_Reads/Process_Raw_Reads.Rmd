@@ -1,0 +1,567 @@
+---
+title: "Process_Raw_Reads"
+output: html_document
+author: "Ozge S. Kuddar"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+# Process from nochim to count data, RA data, for family, genus, species levels with different RA tresholds
+
+```{R}
+
+library(arrow)
+library(dada2)
+
+set.seed(2025)
+
+its2_samples <- read_feather("/Users/PhD_Process/The_Last_Process/DNAPool_ALL_its2_concat_dada2_nochim.feather")
+trnl_samples <- read_feather("/Users/PhD_Process/The_Last_Process/DNAPool_ALL_trnl_merged_dada2_nochim.feather")
+
+its2_samples <- as.data.frame(its2_samples)
+trnl_samples <- as.data.frame(trnl_samples)
+colnames(trnl_samples)[colnames(trnl_samples) == "X"] <- "Sample"
+colnames(its2_samples)[colnames(its2_samples) == "X"] <- "Sample"
+
+
+###############################################################
+trnl_taxa <- assignTaxonomy ((colnames(trnl_samples)[-1]), "/Users/PhD_Process/trnl_its2_DB_Paper/DBs_dada2_BRC/Obitools_trnl_CH_Final_NBC.fasta", multithread=TRUE)
+
+its2_taxa <- assignTaxonomy ((colnames(its2_samples)[-1]), "/Users/PhD_Process/trnl_its2_DB_Paper/ITS2_DBs/Obitools/Obi_ITS2_Combined_Final_dada2_NBC.fasta", multithread=TRUE)
+
+###############################################################
+# Save trnl_taxa
+trnl_taxa_save <- cbind(SeqID = rownames(trnl_taxa), trnl_taxa)
+write_feather(as.data.frame(trnl_taxa_save),
+              "/Users/PhD_Process/The_Last_Process/The_Last_Writing/GitHub/Process_Raw_Reads/Processed_All_Reads/Base_files/trnl_ASV_taxa_withunclassified_Dec_2025.feather")
+
+# Save its2_taxa
+its2_taxa_save <- cbind(SeqID = rownames(its2_taxa), its2_taxa)
+write_feather(as.data.frame(its2_taxa_save),
+              "/Users/PhD_Process/The_Last_Process/The_Last_Writing/GitHub/Process_Raw_Reads/Processed_All_Reads/Base_files/its2_ASV_taxa_withunclassified_Dec_2025.feather")
+###############################################################
+
+trnl_taxa2 <- trnl_taxa
+its2_taxa2 <- its2_taxa
+
+
+fill_taxonomy <- function(taxa_df) {
+  
+  rank_suffixes <- c(
+    Kingdom = "_k",
+    Phylum  = "_p",
+    Class   = "_c",
+    Order   = "_o",
+    Family  = "_f",
+    Genus   = "_g",
+    Species = ""        # species inherits deepest suffix
+  )
+  
+  rank_order <- names(rank_suffixes)
+  n_ranks <- length(rank_order)
+  
+  filled_df <- taxa_df
+  
+  for (i in seq_len(nrow(taxa_df))) {
+    
+    row_vals <- taxa_df[i, ]
+    
+    # all NA → Unclassified
+    if (all(is.na(row_vals))) {
+      filled_df[i, ] <- "Unclassified"
+      next
+    }
+    
+    # deepest known level
+    deepest_known_idx <- max(which(!is.na(row_vals)))
+    deepest_known_value <- row_vals[[deepest_known_idx]]
+    deepest_suffix <- rank_suffixes[deepest_known_idx]
+    
+    # fill all NA *to the right* with deepest_known_value + deepest_suffix
+    for (j in seq_len(n_ranks)) {
+      if (is.na(row_vals[[j]])) {
+        filled_df[i, j] <- paste0(deepest_known_value, deepest_suffix)
+      }
+    }
+  }
+  
+  return(filled_df)
+}
+
+trnl_taxa2 <- fill_taxonomy(trnl_taxa2)
+its2_taxa2 <- fill_taxonomy(its2_taxa2)
+
+any(is.na(trnl_taxa2))
+any(is.na(its2_taxa2))
+
+###############################################################
+# Save trnl_taxa2
+trnl_taxa2_save <- cbind(SeqID = rownames(trnl_taxa2), trnl_taxa2)
+write_feather(as.data.frame(trnl_taxa2_save),
+              "/Users/PhD_Process/The_Last_Process/The_Last_Writing/GitHub/Process_Raw_Reads/Processed_All_Reads/Base_files/trnl_ASV_taxa_filled_Dec_2025.feather")
+
+# Save its2_taxa2
+its2_taxa2_save <- cbind(SeqID = rownames(its2_taxa2), its2_taxa2)
+write_feather(as.data.frame(its2_taxa2_save),
+              "/Users/PhD_Process/The_Last_Process/The_Last_Writing/GitHub/Process_Raw_Reads/Processed_All_Reads/Base_files/its2_ASV_taxa_filled_Dec_2025.feather")
+###############################################################
+######################################################################
+
+aggregate_taxa_levels <- function(abundance_matrix, taxa_table) {
+  # Define the ranks to process
+  RANKS <- c("Family", "Genus", "Species")
+  
+  # Ensure the abundance matrix has sample names as rownames
+  # (This assumes the input abundance_matrix already has ASVs as columns and counts as values)
+  
+  # Get the ASV sequences (which are the column names of the abundance matrix)
+  asv_sequences <- colnames(abundance_matrix)
+  
+  # Check if the ASV names in the abundance matrix match the rownames of the taxa table
+  if (!all(asv_sequences %in% rownames(taxa_table))) {
+    stop("Column names (ASVs) in abundance_matrix do not fully match rownames (ASVs) in taxa_table.")
+  }
+  
+  # Use lapply to iterate over the defined ranks
+  results_list <- lapply(RANKS, function(rank) {
+    # 1. Get the taxonomic grouping vector
+    # We select the taxa names for the ASVs present in the abundance matrix
+    grouping_vector <- taxa_table[asv_sequences, rank]
+    
+    # 2. Perform aggregation using rowsum on the transposed abundance matrix
+    # Note: t(abundance_matrix) makes ASVs rows. rowsum sums the counts for shared taxa (group).
+    # t() transposes back to Samples x Taxa.
+    # na.rm = TRUE handles any unexpected NAs that may have been missed during initial 'Unclassified' replacement
+    
+    # Check if the abundance matrix has more than one row (sample) before transposing
+    # and setting row/col names for t() and rowsum() stability
+    if (nrow(abundance_matrix) == 0) {
+      warning(paste("Abundance matrix is empty for rank:", rank))
+      return(NULL)
+    }
+    
+    aggregated_matrix <- t(rowsum(
+      t(abundance_matrix),
+      group = grouping_vector,
+      na.rm = TRUE
+    ))
+    
+    # 3. Convert the result to a data frame
+    return(as.data.frame(aggregated_matrix))
+  })
+  
+  # Name the list elements for easy access
+  names(results_list) <- RANKS
+  
+  return(results_list)
+}
+
+# ----------------------------------------------------------------------
+# Pre-processing of the data before calling the function
+# (This setup block is necessary before the single function call)
+# ----------------------------------------------------------------------
+
+
+# STEP 1: Prepare Abundance Matrices (ASVs as columns, Samples as rows/rownames)
+# For trnl:
+trnl_abund_matrix <- as.matrix(trnl_samples[, -1])
+rownames(trnl_abund_matrix) <- trnl_samples[, 1]
+
+# For its2:
+its2_abund_matrix <- as.matrix(its2_samples[, -1])
+rownames(its2_abund_matrix) <- its2_samples[, 1]
+
+# ----------------------------------------------------------------------
+# SINGLE FUNCTION CALLS TO GENERATE ALL 6 DATA FRAMES
+# ----------------------------------------------------------------------
+
+# Generate the three TRNL data frames
+trnl_results <- aggregate_taxa_levels(trnl_abund_matrix, trnl_taxa2)
+
+# Generate the three ITS2 data frames
+its2_results <- aggregate_taxa_levels(its2_abund_matrix, its2_taxa2)
+
+# Assign the 6 data frames to individual variables for convenience (as requested by previous output format)
+trnl_family <- trnl_results$Family
+trnl_genus  <- trnl_results$Genus
+trnl_species <- trnl_results$Species
+
+its2_family <- its2_results$Family
+its2_genus  <- its2_results$Genus
+its2_species <- its2_results$Species
+
+####################################################################################
+# Save no_RA_treshold files
+library(arrow)
+
+df_list <- list(
+  trnl_family,
+  trnl_genus,
+  trnl_species,
+  its2_family,
+  its2_genus,
+  its2_species
+)
+
+df_names <- c(
+  "trnl_family_count_Dec2025",
+  "trnl_genus_count_Dec2025",
+  "trnl_species_count_Dec2025",
+  "its2_family_count_Dec2025",
+  "its2_genus_count_Dec2025",
+  "its2_species_count_Dec2025"
+)
+
+for (i in seq_along(df_list)) {
+  df_temp <- df_list[[i]]
+  df_out  <- cbind(Sample = rownames(df_temp), df_temp)
+  write_feather(as.data.frame(df_out),
+                paste0("/Users/PhD_Process/The_Last_Process/The_Last_Writing/GitHub/Process_Raw_Reads/Processed_All_Reads/", df_names[i], ".feather"))
+}
+
+####################################################################################
+
+# Convert to RA 
+
+make_RA <- function(df_list) {
+  lapply(df_list, function(df) {
+    df2 <- df[ , colSums(df) > 0, drop = FALSE]
+    df2 <- df2[rowSums(df2) > 0, , drop = FALSE]
+    df2 / rowSums(df2)
+  })
+}
+
+df_list <- list(
+  trnl_family,
+  trnl_genus,
+  trnl_species,
+  its2_family,
+  its2_genus,
+  its2_species
+)
+
+RA_list <- make_RA(df_list)
+
+trnl_family_RA  <- RA_list[[1]]
+trnl_genus_RA   <- RA_list[[2]]
+trnl_species_RA <- RA_list[[3]]
+its2_family_RA  <- RA_list[[4]]
+its2_genus_RA   <- RA_list[[5]]
+its2_species_RA <- RA_list[[6]]
+
+
+
+####################################################################################
+
+
+# Save different RA treshold files
+
+library(arrow)
+
+apply_thresholds <- function(df_list, df_names, thresholds) {
+  
+  invisible(
+    lapply(thresholds, function(t) {
+      lapply(seq_along(df_list), function(i) {
+        
+        df_temp <- df_list[[i]]
+        df_temp[df_temp < t] <- 0
+        
+        df_temp <- df_temp[ , colSums(df_temp) > 0, drop = FALSE]
+        df_temp <- df_temp[rowSums(df_temp) > 0, , drop = FALSE]
+        
+        df_out <- cbind(Sample = rownames(df_temp), df_temp)
+        
+        write_feather(
+          as.data.frame(df_out),
+          paste0("/Users/PhD_Process/The_Last_Process/The_Last_Writing/GitHub/Process_Raw_Reads/Processed_All_Reads/",
+                 df_names[i], "_", t, "_Dec2025.feather")
+        )
+      })
+    })
+  )
+}
+
+df_list <- list(
+  trnl_family_RA,
+  trnl_genus_RA,
+  trnl_species_RA,
+  its2_family_RA,
+  its2_genus_RA,
+  its2_species_RA
+)
+
+df_names <- c(
+  "trnl_family",
+  "trnl_genus",
+  "trnl_species",
+  "its2_family",
+  "its2_genus",
+  "its2_species"
+)
+
+thresholds <- c(1e-8, 0.0004, 0.001, 0.01)
+
+apply_thresholds(df_list, df_names, thresholds)
+
+
+
+
+# Check prevalence and median RA for unclassified classified (_{X}) columns
+
+library(arrow)
+
+path <- "/Users/PhD_Process/The_Last_Process/The_Last_Writing/GitHub/Process_Raw_Reads/Processed_All_Reads/"
+
+files <- c(
+  "trnl_species_1e-08_Dec2025.feather",
+  "trnl_species_4e-04_Dec2025.feather",
+  "trnl_species_0.001_Dec2025.feather",
+  "trnl_species_0.01_Dec2025.feather"
+)
+
+files <- file.path(path, files)
+
+suffixes <- c("_k","_p","_c","_o","_f","_g")
+
+compute_stats <- function(df) {
+  
+  df <- df[grep("Sample", df$Sample), , drop = FALSE]
+  
+  out <- lapply(suffixes, function(suf) {
+    
+    cols <- grep(paste0(suf, "$"), colnames(df), value = TRUE)
+    if (length(cols) == 0) return(c(mean = NA, prevalence_percent = NA))
+    
+    vals <- df[, cols, drop = FALSE]
+    nonzero <- unlist(vals)
+    nonzero <- nonzero[nonzero > 0]
+    
+    med <- if (length(nonzero) == 0) NA_real_ else mean(nonzero)
+    prev <- round(mean(rowSums(vals > 0) > 0) * 100,2)   # percentage
+    
+    c(mean = med, prevalence_percent = prev)
+  })
+  
+  out_vec <- unlist(out)
+  names(out_vec) <- paste0(
+    rep(suffixes, each = 2),
+    c(".mean", ".prevalence_percent")
+  )
+  
+  out_vec
+}
+
+result_table <- do.call(
+  rbind,
+  lapply(files, function(f) {
+    df <- as.data.frame(read_feather(f))
+    stats <- compute_stats(df)
+    cbind(File = basename(f), t(stats))
+  })
+)
+
+
+```
+
+# Generate Sample and Control Samples files 
+
+```{R}
+library(arrow)
+
+base_path <- "/Users/PhD_Process/The_Last_Process/The_Last_Writing/GitHub/Process_Raw_Reads/Processed_All_Reads"
+
+# list ONLY files in this folder (no subfolders) that end with .feather
+files <- list.files(
+  base_path,
+  pattern = "\\.feather$",
+  full.names = TRUE,
+  recursive = FALSE
+)
+
+# extract clean names without "_Dec2025.feather"
+clean_names <- sub("_Dec2025\\.feather$", "", basename(files))
+
+# read all feather files into a named list
+df_list <- lapply(files, function(f) as.data.frame(read_feather(f)))
+names(df_list) <- clean_names
+
+# Cleanup 
+rows_to_remove <- c(
+  "DNAPool1_A10","DNAPool1_A11","DNAPool1_A12",
+  "DNAPool3_Sample-107","DNAPool3_Sample-118","DNAPool3_Sample-122"
+)
+
+df_list <- lapply(df_list, function(df) {
+  
+  df <- df[!df$Sample %in% rows_to_remove, ]
+  
+  df$Sample[df$Sample == "DNAPool3_E1"] <- "DNAPool3_Sample-107"
+  df$Sample[df$Sample == "DNAPool3_G1"] <- "DNAPool3_Sample-118"
+  df$Sample[df$Sample == "DNAPool3_H1"] <- "DNAPool3_Sample-122"
+  
+  df
+})
+
+
+# Create files only for Samples
+
+out_path <- "/Users/PhD_Process/The_Last_Process/The_Last_Writing/GitHub/Process_Raw_Reads/Sample_Reads/"
+
+# iterate through df_list using names(df_list)
+invisible(
+  lapply(names(df_list), function(nm) {
+    
+    df <- df_list[[nm]]
+    
+    # keep only rows where Sample contains "Sample"
+    df2 <- df[grep("Sample", df$Sample), , drop = FALSE]
+    
+    # remove zero-sum columns (but keep Sample column)
+    numeric_cols <- setdiff(colnames(df2), "Sample")
+    keep_numeric <- numeric_cols[colSums(df2[, numeric_cols, drop = FALSE]) > 0]
+    df2 <- df2[, c("Sample", keep_numeric), drop = FALSE]
+    
+    # output file name
+    out_file <- paste0(out_path, "Samples_", nm, ".feather")
+    
+    write_feather(as.data.frame(df2), out_file)
+  })
+)
+
+
+
+# Create files only for Control Samples
+
+out_path <- "/Users/PhD_Process/The_Last_Process/The_Last_Writing/GitHub/Process_Raw_Reads/Control_Sample_Reads/"
+
+control_patterns <- c(
+  "High_Pollen_Only",
+  "High_Pollen_Soil",
+  "Neg_Extr_Cntrl",
+  "Pollen_Pool_Amp_Cntrl",
+  "Low_Pollen_Only",
+  "Low_Pollen_Soil",
+  "Cntrl_96",
+  "Cntrl_95",
+  "Soil_Only",
+  "Water_Cntrl",
+  "Tissue_Pool_Amp_Cntrl"
+)
+
+pattern_regex <- paste(control_patterns, collapse = "|")
+
+invisible(
+  lapply(names(df_list), function(nm) {
+    
+    df <- df_list[[nm]]
+    
+    # keep only control samples
+    df2 <- df[grep(pattern_regex, df$Sample), , drop = FALSE]
+    
+    # remove zero-sum numeric columns (keep Sample)
+    numeric_cols <- setdiff(colnames(df2), "Sample")
+    keep_numeric <- numeric_cols[colSums(df2[, numeric_cols, drop = FALSE]) > 0]
+    df2 <- df2[, c("Sample", keep_numeric), drop = FALSE]
+    
+    # output filename
+    out_file <- paste0(out_path, "Control_Samples_", nm, ".feather")
+    
+    write_feather(as.data.frame(df2), out_file)
+  })
+)
+
+
+```
+
+
+# ITS2 and trnL combination
+
+```{R}
+library(arrow)
+
+set.seed(1881)
+low_count_value <- 1e-6
+
+trnl_cross_contam <- c("Sample8", "Sample13")
+low_rc <- c("Sample3", "Sample30", "Sample56", "Sample58",
+            "Sample160", "Sample175", "Sample186", "Sample193")
+
+filter_zero_rows_cols <- function(df_input) {
+  df_step1 <- df_input[, colSums(df_input) > 0, drop = FALSE]
+  df_step2 <- df_step1[rowSums(df_step1) > 0, , drop = FALSE]
+  df_step2
+}
+
+levels_vec <- c("family", "genus", "species")
+thresholds <- c("4e-04", "1e-08", "0.001", "0.01")
+
+for (lv in levels_vec) {
+  for (th in thresholds) {
+    
+    its2_path <- paste0(
+      "/Users/PhD_Process/The_Last_Process/The_Last_Writing/GitHub/Process_Raw_Reads/",
+      "Sample_Reads/Samples_its2_", lv, "_", th, ".feather"
+    )
+    trnl_path <- paste0(
+      "/Users/PhD_Process/The_Last_Process/The_Last_Writing/GitHub/Process_Raw_Reads/",
+      "Sample_Reads/Samples_trnl_", lv, "_", th, ".feather"
+    )
+    
+    its2_RA <- as.data.frame(read_feather(its2_path))
+    trnl_RA <- as.data.frame(read_feather(trnl_path))
+    
+    rownames(its2_RA) <- its2_RA$Sample
+    rownames(trnl_RA) <- trnl_RA$Sample
+    its2_RA$Sample <- NULL
+    trnl_RA$Sample <- NULL
+    
+    its2_RA[is.na(its2_RA)] <- 0
+    trnl_RA[is.na(trnl_RA)] <- 0
+    
+    rownames(its2_RA) <- gsub("DNAPool[1-6]_", "", rownames(its2_RA))
+    rownames(trnl_RA) <- gsub("DNAPool[1-6]_", "", rownames(trnl_RA))
+    rownames(its2_RA) <- gsub("-", "", rownames(its2_RA))
+    rownames(trnl_RA) <- gsub("-", "", rownames(trnl_RA))
+    rownames(its2_RA) <- gsub("_", "", rownames(its2_RA))
+    rownames(trnl_RA) <- gsub("_", "", rownames(trnl_RA))
+    
+    trnl_RA <- trnl_RA[!rownames(trnl_RA) %in% c(trnl_cross_contam, low_rc), , drop = FALSE]
+    its2_RA <- its2_RA[!rownames(its2_RA) %in% low_rc, , drop = FALSE]
+    
+    its2_RA <- filter_zero_rows_cols(its2_RA)
+    trnl_RA <- filter_zero_rows_cols(trnl_RA)
+    
+    all_samples <- union(rownames(trnl_RA), rownames(its2_RA))
+    all_taxa    <- union(colnames(trnl_RA), colnames(its2_RA))
+    
+    trnl_full <- matrix(0, nrow = length(all_samples), ncol = length(all_taxa),
+                        dimnames = list(all_samples, all_taxa))
+    its2_full <- matrix(0, nrow = length(all_samples), ncol = length(all_taxa),
+                        dimnames = list(all_samples, all_taxa))
+    
+    trnl_full[rownames(trnl_RA), colnames(trnl_RA)] <- as.matrix(trnl_RA)
+    its2_full[rownames(its2_RA), colnames(its2_RA)] <- as.matrix(its2_RA)
+    
+    trnl_its2 <- trnl_full + its2_full
+    trnl_its2 <- filter_zero_rows_cols(trnl_its2)
+    
+    trnl_its2 <- trnl_its2 / rowSums(trnl_its2)
+
+    trnl_its2 <- as.data.frame(trnl_its2)
+    trnl_its2 <- cbind(Sample = rownames(trnl_its2), trnl_its2)
+    
+    out_path <- paste0(
+      "/Users/PhD_Process/The_Last_Process/The_Last_Writing/GitHub/Process_Raw_Reads/",
+      "Sample_Reads/Samples_trnl_its2_", lv, "_", th, ".feather"
+    )
+    
+    write_feather(trnl_its2, out_path)
+  }
+}
+
+```
+
